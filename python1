@@ -1,0 +1,182 @@
+import argparse, io, os, sys, time, tarfile, bz2
+from pathlib import Path
+from typing import Optional
+from compression import zstd
+
+def print_progress(cur: int, total: int, prefix: str = "", width: int = 50):
+    if total <= 0: return
+    p = min(cur / total, 1.0)
+    bar = "█" * int(width * p) + "░" * (width - int(width * p))
+    sys.stdout.write(f"\r{prefix} |{bar}| {p:6.1%} ({cur}/{total})")
+    sys.stdout.flush()
+
+def _count_files(p: Path) -> int:
+    return 1 if p.is_file() else sum(1 for _ in p.rglob("*") if _.is_file())
+
+def _archive_tar(src: Path, buf: io.BytesIO, prog: bool, total: int):
+    proc = 0
+    with tarfile.open(fileobj=buf, mode="w") as t:
+        if src.is_file():
+            t.add(src, arcname=src.name); proc += 1
+        else:
+            for r, _, fs in os.walk(src):
+                for f in fs:
+                    fp = Path(r) / f
+                    t.add(fp, arcname=fp.relative_to(src))
+                    if prog: print_progress(proc, total, "Архивация: "); proc += 1
+    if prog: print_progress(proc, total, "Архивация: "); print()
+
+def _compress_zstd(buf: io.BytesIO, dst: Path, prog: bool = False):
+    c = zstd.ZstdCompressor()
+    buf.seek(0)
+    with open(dst, 'wb') as f:
+        proc = 0; total = buf.getbuffer().nbytes
+        if prog: print_progress(0, total, "Сжатие: ")
+        for chunk in iter(lambda: buf.read(8192), b''):
+            f.write(c.compress(chunk))
+            proc += len(chunk)
+            if prog: print_progress(proc, total, "Сжатие: ")
+        f.write(c.flush())
+    if prog: print_progress(total, total, "Сжатие: "); print()
+
+def archive(src: Path, dst: Path, progress=False, benchmark=False) -> Optional[float]:
+    start = time.perf_counter() if benchmark else None
+    if not src.exists(): print(f"Ошибка: {src} не найден", file=sys.stderr); return None
+
+    name = dst.name.lower()
+    fmt = ('tar', 'bz2') if name.endswith('.tar.bz2') else \
+          ('tar', 'zst') if name.endswith('.tar.zst') else \
+          ('single', 'bz2') if name.endswith('.bz2') else \
+          ('single', 'zst') if name.endswith('.zst') else None
+    if not fmt: print("Ошибка: только .bz2, .zst, .tar.bz2, .tar.zst", file=sys.stderr); return None
+    if src.is_dir() and fmt[0] != 'tar':
+        print("Ошибка: для папок — .tar.bz2/.tar.zst", file=sys.stderr); return None
+
+    try:
+        if fmt[0] == 'tar':
+            total = _count_files(src)
+            buf = io.BytesIO()
+            _archive_tar(src, buf, progress and fmt[1] == 'bz2', total)
+            if fmt[1] == 'bz2':
+                buf.seek(0)
+                with tarfile.open(dst, "w:bz2") as t: t.addfile(tarfile.TarInfo("data"), buf)
+            else:
+                _compress_zstd(buf, dst, progress)
+        else:
+            total = src.stat().st_size
+            if progress: print_progress(0, total, "Архивация: ")
+            with open(src, 'rb') as fin, open(dst, 'wb') as fout:
+                if fmt[1] == 'bz2':
+                    with bz2.open(fout, 'wb') as bz: 
+                        proc = 0
+                        for chunk in iter(lambda: fin.read(8192), b''):
+                            bz.write(chunk); proc += len(chunk)
+                            if progress: print_progress(proc, total, "Архивация: ")
+                else:
+                    c = zstd.ZstdCompressor()
+                    proc = 0
+                    for chunk in iter(lambda: fin.read(8192), b''):
+                        fout.write(c.compress(chunk)); proc += len(chunk)
+                        if progress: print_progress(proc, total, "Архивация: ")
+                    fout.write(c.flush())
+            if progress: print_progress(total, total, "Архивация: "); print()
+
+        if dst.exists():
+            size_mb = dst.stat().st_size / (1024*1024)
+            if benchmark:
+                t = time.perf_counter() - start
+                print(f"Архивация завершена за {t:.2f} сек. Размер: {size_mb:.2f} МБ")
+                return t
+            print(f"Архив создан: {dst}")
+        return None
+    except Exception as e:
+        print(f"Ошибка архивации: {e}", file=sys.stderr); return None
+
+def extract(arc: Path, dest: Path, progress=False, benchmark=False) -> Optional[float]:
+    start = time.perf_counter() if benchmark else None
+    if not arc.exists(): print(f"Ошибка: {arc} не найден", file=sys.stderr); return None
+
+    name = arc.name.lower()
+    fmt = ('tar', 'bz2') if name.endswith('.tar.bz2') else \
+          ('tar', 'zst') if name.endswith('.tar.zst') else \
+          ('single', 'bz2') if name.endswith('.bz2') else \
+          ('single', 'zst') if name.endswith('.zst') else None
+    if not fmt: print("Ошибка: только .bz2, .zst, .tar.bz2, .tar.zst", file=sys.stderr); return None
+
+    dest.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if fmt[0] == 'tar':
+            if fmt[1] == 'bz2':
+                with tarfile.open(arc, "r:bz2") as t:
+                    m = t.getmembers(); total = len(m)
+                    for i, mem in enumerate(m):
+                        if progress: print_progress(i, total, "Распаковка: ")
+                        t.extract(mem, path=dest)
+                    if progress: print_progress(total, total, "Распаковка: "); print()
+            else:
+                d = zstd.ZstdDecompressor()
+                buf = io.BytesIO()
+                with open(arc, 'rb') as f:
+                    for chunk in iter(lambda: f.read(8192), b''):
+                        buf.write(d.decompress(chunk))
+                buf.seek(0)
+                with tarfile.open(fileobj=buf, mode="r:") as t:
+                    m = t.getmembers(); total = len(m)
+                    for i, mem in enumerate(m):
+                        if progress: print_progress(i, total, "Распаковка: ")
+                        t.extract(mem, path=dest)
+                    if progress: print_progress(total, total, "Распаковка: "); print()
+        else:
+            out = dest / arc.stem
+            total = arc.stat().st_size
+            if progress: print_progress(0, total, "Распаковка: ")
+            with open(arc, 'rb') as fin, open(out, 'wb') as fout:
+                if fmt[1] == 'bz2':
+                    with bz2.open(fin, 'rb') as bz:
+                        proc = 0
+                        for chunk in iter(lambda: bz.read(8192), b''):
+                            fout.write(chunk); proc += len(chunk)
+                            if progress: print_progress(proc, total, "Распаковка: ")
+                else:
+                    d = zstd.ZstdDecompressor()
+                    proc = 0
+                    for chunk in iter(lambda: fin.read(8192), b''):
+                        fout.write(d.decompress(chunk)); proc += len(chunk)
+                        if progress: print_progress(proc, total, "Распаковка: ")
+            if progress: print_progress(total, total, "Распаковка: "); print()
+
+        if benchmark:
+            t = time.perf_counter() - start
+            print(f"Распаковка завершена за {t:.2f} сек.")
+            return t
+        print(f"Распаковано в: {dest}")
+        return None
+    except Exception as e:
+        print(f"Ошибка распаковки: {e}", file=sys.stderr); return None
+
+def main():
+    p = argparse.ArgumentParser(
+        description="LP1.py - архиватор (bz2/zstd)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Примеры:
+  python python1.py archive input.txt out.zst --progress
+  python python1.py archive folder/ out.tar.bz2 --benchmark
+  python python1.py extract out.tar.zst ./out/ --progress"""
+    )
+    s = p.add_subparsers(dest="cmd", required=True)
+    a = s.add_parser("archive", help="Архивировать")
+    a.add_argument("src", type=Path); a.add_argument("dst", type=Path)
+    a.add_argument("--progress", action="store_true"); a.add_argument("--benchmark", action="store_true")
+    e = s.add_parser("extract", help="Распаковать")
+    e.add_argument("archive", type=Path); e.add_argument("dest", type=Path, nargs="?", default=Path("."))
+    e.add_argument("--progress", action="store_true"); e.add_argument("--benchmark", action="store_true")
+    args = p.parse_args()
+    (archive if args.cmd == "archive" else extract)(
+        args.src if args.cmd == "archive" else args.archive,
+        args.dst if args.cmd == "archive" else args.dest,
+        args.progress, args.benchmark
+    )
+
+if __name__ == "__main__":
+    main()
