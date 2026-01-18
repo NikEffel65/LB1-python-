@@ -35,7 +35,7 @@ python lb1.py compress file.txt archive.bz2 --progress --benchmark
 ### **Скриншот 2: Распаковка файла(bz2)**
 <img width="654" height="52" alt="2025-12-16_21-15-56" src="https://github.com/user-attachments/assets/905fcc9a-63b1-41a9-bb6d-4b32401032cd" />
 
-### **Скриншот 3: Архивацияфайла(zst)**
+### **Скриншот 3: Архивация файла(zst)**
 <img width="1631" height="458" alt="2025-12-16_21-50-19" src="https://github.com/user-attachments/assets/b0190809-1abe-4330-b757-18caf682050c" />
 
 ### **Скриншот 4: Распаковка директории(zst)**
